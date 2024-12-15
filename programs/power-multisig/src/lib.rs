@@ -2,7 +2,6 @@ use anchor_lang::prelude::*;
 use anchor_lang::solana_program::{instruction::Instruction, program::invoke_signed};
 declare_id!("U8QgybKox2a31mTqKrpywzotFZ1nAqvk7erYTByDxui");
 
-
 #[program]
 pub mod multisig_wallet {
     use super::*;
@@ -13,20 +12,26 @@ pub mod multisig_wallet {
         owners: Vec<OwnerConfig>,
         threshold_weight: u64,
     ) -> Result<()> {
-        require!(threshold_weight > 0, ErrorCode::InvalidThreshold);
-        let total_weight: u64 = owners.iter().map(|owner| owner.weight).sum();
-        require!(threshold_weight <= total_weight, ErrorCode::ThresholdTooHigh);
-        require!(!owners.is_empty(), ErrorCode::NoOwners);
-        
         // 确保owner不重复
         assert_unique_owners(&owners)?;
+        // 首先检查是否有owners
+        require!(!owners.is_empty(), ErrorCode::NoOwners);
+        // 然后检查owners的权重和唯一性
+        assert_unique_owners(&owners)?;
+        // 再检查阈值是否有效
+        require!(threshold_weight > 0, ErrorCode::InvalidThreshold);
+        let total_weight: u64 = owners.iter().map(|owner| owner.weight).sum();
+        require!(
+            threshold_weight <= total_weight,
+            ErrorCode::ThresholdTooHigh
+        );
 
         let wallet = &mut ctx.accounts.wallet;
         wallet.owners = owners;
         wallet.threshold_weight = threshold_weight;
         wallet.nonce = ctx.bumps.vault;
         wallet.owner_set_seqno = 0;
-        
+
         Ok(())
     }
 
@@ -50,7 +55,7 @@ pub mod multisig_wallet {
         transaction.executed = false;
         transaction.signers = vec![owner.key()];
         transaction.owner_set_seqno = wallet.owner_set_seqno;
-        
+
         Ok(())
     }
 
@@ -82,74 +87,225 @@ pub mod multisig_wallet {
         );
 
         transaction.signers.push(signer.key());
-        
+
         Ok(())
     }
 
     // 执行交易提案
+
+
     pub fn execute_transaction(ctx: Context<ExecuteTransaction>) -> Result<()> {
         let wallet = &ctx.accounts.wallet;
         let transaction = &mut ctx.accounts.transaction;
+        let vault = &ctx.accounts.vault;
         
-        // 验证交易未执行
-        require!(!transaction.executed, ErrorCode::AlreadyExecuted);
-
-        // 验证owner set没有变化
-        require!(
-            wallet.owner_set_seqno == transaction.owner_set_seqno,
-            ErrorCode::OwnerSetChanged
-        );
-
         // 计算签名权重
-        let mut total_weight = 0u64;
-        for signer in transaction.signers.iter() {
-            if let Some(owner) = wallet.owners.iter().find(|o| o.key == *signer) {
-                total_weight += owner.weight;
-            }
-        }
-
+        let total_weight = calculate_total_weight(wallet, &transaction.signers)?;
+    
         // 验证签名权重是否达到阈值
         require!(
             total_weight >= wallet.threshold_weight,
             ErrorCode::InsufficientSigners
         );
 
-        // 准备PDA签名
-        let vault_seeds = &[
+        // 准备vault PDA的签名种子
+        let seeds = &[
             b"vault",
             wallet.to_account_info().key.as_ref(),
             &[wallet.nonce],
         ];
-        let signer_seeds = &[&vault_seeds[..]];
+        let signer_seeds = &[&seeds[..]];
+    
+              // 添加日志来追踪账户信息
+    msg!("Vault pubkey: {}", ctx.accounts.vault.key());
+    msg!("Vault is_signer: {}", ctx.accounts.vault.is_signer);
+    msg!("Vault is_writable: {}", ctx.accounts.vault.is_writable);
+        // 执行每条指令
+        for (i, instruction) in transaction.instructions.iter().enumerate() {
+            msg!("Processing instruction {}", i);
 
-        // 执行所有指令
-        for instruction in transaction.instructions.iter() {
-            // 根据是否需要PDA签名修改账户元数据
-            let mut ix = Instruction {
-                program_id: instruction.program_id,
-                accounts: instruction.accounts.iter().map(|acc| {
-                    let mut meta = acc.to_account_meta();
-                    if meta.pubkey == ctx.accounts.vault.key() {
-                        meta.is_signer = true;
+            // 确保vault已经在指令的accounts中被正确设置为签名者
+            let vault_index = instruction.accounts
+                .iter()
+                .position(|acc| acc.pubkey == vault.key())
+                .ok_or(ErrorCode::AccountNotFound)?;
+            
+            // 转换账户元数据
+            let  accounts_metas: Vec<AccountMeta> = instruction.accounts
+                .iter()
+                .enumerate()
+                .map(|(idx, acc)| {
+                    let is_vault = idx == vault_index;
+                    AccountMeta {
+                        pubkey: acc.pubkey,
+                        is_signer: is_vault || acc.is_signer,
+                        is_writable: acc.is_writable,
                     }
-                    meta
-                }).collect(),
+                })
+                .collect();
+
+            // 构建新指令
+            let ix = Instruction {
+                program_id: instruction.program_id,
+                accounts: accounts_metas,
                 data: instruction.data.clone(),
             };
+            msg!("Instruction accounts:");
+            for (j, acc) in ix.accounts.iter().enumerate() {
+                msg!(
+                    "Account {}: pubkey={}, is_signer={}, is_writable={}",
+                    j,
+                    acc.pubkey,
+                    acc.is_signer,
+                    acc.is_writable
+                );
+            }
 
-            // 执行指令
+            // 从remaining_accounts中收集账户信息
+            let account_infos: Vec<AccountInfo> = ctx.remaining_accounts
+                .iter()
+                .map(|acc| acc.to_account_info())
+                .collect();
+
+            msg!("Invoking CPI with {} account infos", account_infos.len());
+
+            // 执行CPI调用
             invoke_signed(
                 &ix,
-                ctx.remaining_accounts,
-                signer_seeds,
-            )?;
+                &account_infos,
+                signer_seeds 
+
+            ).map_err(|_| error!(ErrorCode::TransactionExecutionFailed))?;
+
+            msg!("Instruction {} executed successfully", i);
+        }
+    
+        transaction.executed = true;
+        Ok(())
+    }
+
+    // 修改阈值权重
+    pub fn change_threshold(ctx: Context<ChangeThreshold>, new_threshold: u64) -> Result<()> {
+        let wallet = &mut ctx.accounts.wallet;
+        let total_weight: u64 = wallet.owners.iter().map(|owner| owner.weight).sum();
+
+        // 校验新阈值合理性
+        require!(new_threshold > 0, ErrorCode::InvalidThreshold);
+        require!(new_threshold <= total_weight, ErrorCode::ThresholdTooHigh);
+
+        // 更新阈值并增加序列号
+        wallet.threshold_weight = new_threshold;
+        wallet.owner_set_seqno += 1;
+
+        Ok(())
+    }
+
+    // 修改单个owner权重
+    pub fn change_owner_weight(
+        ctx: Context<ChangeOwnerWeight>,
+        owner_key: Pubkey,
+        new_weight: u64,
+    ) -> Result<()> {
+        let wallet = &mut ctx.accounts.wallet;
+
+        // 校验新权重
+        require!(new_weight > 0, ErrorCode::InvalidOwnerWeight);
+
+        // 找到并修改owner权重
+        if let Some(owner) = wallet.owners.iter_mut().find(|o| o.key == owner_key) {
+            let old_weight = owner.weight;
+            owner.weight = new_weight;
+
+            // 计算新的总权重
+            let total_weight: u64 = wallet.owners.iter().map(|o| o.weight).sum();
+
+            // 确保阈值仍然有效
+            require!(
+                wallet.threshold_weight <= total_weight,
+                ErrorCode::ThresholdTooHigh
+            );
+
+            wallet.owner_set_seqno += 1;
+        } else {
+            return err!(ErrorCode::OwnerNotFound);
         }
 
-        transaction.executed = true;
-        Ok(())   
+        Ok(())
+    }
+
+    // 修改整体权重方案
+    pub fn change_owner_weights(
+        ctx: Context<ChangeOwnerWeights>,
+        new_weights: Vec<OwnerConfig>,
+    ) -> Result<()> {
+        let wallet = &mut ctx.accounts.wallet;
+
+        // 验证新权重配置中包含所有现有owner
+        require!(
+            wallet.owners.len() == new_weights.len(),
+            ErrorCode::InvalidOwnerCount
+        );
+
+        // 验证新权重配置中的owner都是有效的
+        for new_config in new_weights.iter() {
+            require!(
+                wallet.owners.iter().any(|o| o.key == new_config.key),
+                ErrorCode::OwnerNotFound
+            );
+            require!(new_config.weight > 0, ErrorCode::InvalidOwnerWeight);
+        }
+
+        // 计算新的总权重
+        let new_total_weight: u64 = new_weights.iter().map(|o| o.weight).sum();
+        require!(
+            wallet.threshold_weight <= new_total_weight,
+            ErrorCode::ThresholdTooHigh
+        );
+
+        // 更新权重
+        wallet.owners = new_weights;
+        wallet.owner_set_seqno += 1;
+
+        Ok(())
     }
 }
 
+
+
+// 签名权重计算
+fn calculate_total_weight(wallet: &Account<Wallet>, signers: &[Pubkey]) -> Result<u64> {
+    let mut total_weight = 0u64;
+    
+    for signer in signers.iter() {
+        if let Some(owner) = wallet.owners.iter().find(|o| o.key == *signer) {
+            total_weight = total_weight.checked_add(owner.weight)
+                .ok_or(ErrorCode::ArithmeticOverflow)?;
+        }
+    }
+    
+    Ok(total_weight)
+}
+
+#[derive(Accounts)]
+pub struct ChangeThreshold<'info> {
+    #[account(mut)]
+    pub wallet: Account<'info, Wallet>,
+    pub proposer: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct ChangeOwnerWeight<'info> {
+    #[account(mut)]
+    pub wallet: Account<'info, Wallet>,
+    pub proposer: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct ChangeOwnerWeights<'info> {
+    #[account(mut)]
+    pub wallet: Account<'info, Wallet>,
+    pub proposer: Signer<'info>,
+}
 #[derive(Accounts)]
 pub struct CreateWallet<'info> {
     #[account(
@@ -162,14 +318,14 @@ pub struct CreateWallet<'info> {
             4   // owner_set_seqno
     )]
     pub wallet: Account<'info, Wallet>,
-    
+
     #[account(
         seeds = [b"vault", wallet.key().as_ref()],
         bump,
     )]
     /// CHECK: This is a PDA that will hold SOL
     pub vault: UncheckedAccount<'info>,
-    
+
     #[account(mut)]
     pub payer: Signer<'info>,
     pub system_program: Program<'info, System>,
@@ -178,7 +334,7 @@ pub struct CreateWallet<'info> {
 #[derive(Accounts)]
 pub struct CreateTransaction<'info> {
     pub wallet: Account<'info, Wallet>,
-    
+
     #[account(
         init,
         payer = owner,
@@ -190,7 +346,7 @@ pub struct CreateTransaction<'info> {
             4   // owner_set_seqno
     )]
     pub transaction: Account<'info, Transaction>,
-    
+
     #[account(mut)]
     pub owner: Signer<'info>,
     pub system_program: Program<'info, System>,
@@ -204,19 +360,41 @@ pub struct Approve<'info> {
     pub owner: Signer<'info>,
 }
 
+
+
+
 #[derive(Accounts)]
 pub struct ExecuteTransaction<'info> {
+    /// 多签钱包账户
     pub wallet: Account<'info, Wallet>,
-    #[account(mut)]
-    pub transaction: Account<'info, Transaction>,
-    pub owner: Signer<'info>,
-    
+
+    /// 交易提案账户
     #[account(
+        mut,
+        constraint = transaction.wallet == wallet.key() @ ErrorCode::InvalidWallet,
+        constraint = !transaction.executed @ ErrorCode::AlreadyExecuted,
+        constraint = wallet.owner_set_seqno == transaction.owner_set_seqno @ ErrorCode::OwnerSetChanged,
+        has_one = wallet @ ErrorCode::InvalidWallet
+    )]
+    pub transaction: Account<'info, Transaction>,
+
+    /// 执行者（必须是owner且已签名）
+    #[account(
+        constraint = wallet.owners.iter().any(|o| o.key == owner.key()) @ ErrorCode::NotOwner,
+        constraint = transaction.signers.contains(&owner.key()) @ ErrorCode::NotSigned
+    )]
+    pub owner: Signer<'info>,
+
+    /// Vault PDA账户 
+    #[account(
+        mut,  // 确保vault是可写的
         seeds = [b"vault", wallet.key().as_ref()],
         bump = wallet.nonce,
     )]
-    /// CHECK: This is a PDA that holds SOL
+    /// CHECK: Vault PDA, will be used as a signer
     pub vault: UncheckedAccount<'info>,
+
+    pub system_program: Program<'info, System>,
 }
 
 #[account]
@@ -269,7 +447,7 @@ fn assert_unique_owners(owners: &[OwnerConfig]) -> Result<()> {
     for (i, owner) in owners.iter().enumerate() {
         // 检查权重不能为零
         require!(owner.weight > 0, ErrorCode::InvalidOwnerWeight);
-        
+
         // 原有的重复检查
         require!(
             !owners.iter().skip(i + 1).any(|item| item.key == owner.key),
@@ -278,9 +456,49 @@ fn assert_unique_owners(owners: &[OwnerConfig]) -> Result<()> {
     }
     Ok(())
 }
+// 用于接收指令的结构
+#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
+pub struct IncomingInstruction {
+    pub program_id: Pubkey,
+    pub accounts: Vec<TransactionAccount>,
+    pub data: Vec<u8>,
+}
+
+// 实现从solana指令到IncomingInstruction的转换
+impl From<Instruction> for IncomingInstruction {
+    fn from(ix: Instruction) -> Self {
+        IncomingInstruction {
+            program_id: ix.program_id,
+            accounts: ix
+                .accounts
+                .into_iter()
+                .map(|meta| TransactionAccount {
+                    pubkey: meta.pubkey,
+                    is_signer: meta.is_signer,
+                    is_writable: meta.is_writable,
+                })
+                .collect(),
+            data: ix.data,
+        }
+    }
+}
+
+// 与之前的ProposedInstruction保持一致
+impl From<IncomingInstruction> for ProposedInstruction {
+    fn from(incoming: IncomingInstruction) -> Self {
+        ProposedInstruction {
+            program_id: incoming.program_id,
+            accounts: incoming.accounts,
+            data: incoming.data,
+        }
+    }
+}
+
 
 #[error_code]
 pub enum ErrorCode {
+    #[msg("Invalid wallet")]
+    InvalidWallet,
     #[msg("Threshold must be greater than 0")]
     InvalidThreshold,
     #[msg("Threshold must be less than or equal to the total weight")]
@@ -301,4 +519,16 @@ pub enum ErrorCode {
     OwnerSetChanged,
     #[msg("Owner weight must be greater than 0")]
     InvalidOwnerWeight,
+    #[msg("Owner not found")]
+    OwnerNotFound,
+    #[msg("Invalid number of owners")]
+    InvalidOwnerCount,
+    #[msg("Transaction execution failed")]
+    TransactionExecutionFailed,
+    #[msg("Arithmetic overflow")]
+    ArithmeticOverflow,
+    #[msg("Owner has not signed this transaction")]
+    NotSigned,
+    #[msg("Required account not found")]
+    AccountNotFound,
 }
