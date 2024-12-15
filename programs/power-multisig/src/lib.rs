@@ -1,6 +1,12 @@
 use anchor_lang::prelude::*;
 use anchor_lang::solana_program::{instruction::Instruction, program::invoke_signed};
 declare_id!("U8QgybKox2a31mTqKrpywzotFZ1nAqvk7erYTByDxui");
+pub mod error;
+use error::ErrorCode;
+
+
+const MAX_SIGNERS: usize = 10;
+const MAX_INSTRUCTIONS: usize = 5;
 
 #[program]
 pub mod multisig_wallet {
@@ -39,7 +45,25 @@ pub mod multisig_wallet {
     pub fn create_transaction(
         ctx: Context<CreateTransaction>,
         instructions: Vec<ProposedInstruction>,
+        max_accounts_per_instruction: u8,
+        max_data_size: u16,
     ) -> Result<()> {
+        require!(
+            instructions.len() <= MAX_INSTRUCTIONS,
+            ErrorCode::TooManyInstructions
+        );
+
+        // 验证每条指令的账户数量和数据大小
+        for instruction in instructions.iter() {
+            require!(
+                instruction.accounts.len() <= max_accounts_per_instruction as usize,
+                ErrorCode::TooManyAccounts
+            );
+            require!(
+                instruction.data.len() <= max_data_size as usize,
+                ErrorCode::DataTooLarge
+            );
+        }
         let wallet = &ctx.accounts.wallet;
         let owner = &ctx.accounts.owner;
 
@@ -55,6 +79,7 @@ pub mod multisig_wallet {
         transaction.executed = false;
         transaction.signers = vec![owner.key()];
         transaction.owner_set_seqno = wallet.owner_set_seqno;
+        transaction.creator = ctx.accounts.owner.key();
 
         Ok(())
     }
@@ -93,15 +118,14 @@ pub mod multisig_wallet {
 
     // 执行交易提案
 
-
     pub fn execute_transaction(ctx: Context<ExecuteTransaction>) -> Result<()> {
         let wallet = &ctx.accounts.wallet;
         let transaction = &mut ctx.accounts.transaction;
         let vault = &ctx.accounts.vault;
-        
+
         // 计算签名权重
         let total_weight = calculate_total_weight(wallet, &transaction.signers)?;
-    
+
         // 验证签名权重是否达到阈值
         require!(
             total_weight >= wallet.threshold_weight,
@@ -115,31 +139,35 @@ pub mod multisig_wallet {
             &[wallet.nonce],
         ];
         let signer_seeds = &[&seeds[..]];
-    
-              // 添加日志来追踪账户信息
-    msg!("Vault pubkey: {}", ctx.accounts.vault.key());
-    msg!("Vault is_signer: {}", ctx.accounts.vault.is_signer);
-    msg!("Vault is_writable: {}", ctx.accounts.vault.is_writable);
+
+        // 添加日志来追踪账户信息
+        msg!("Vault pubkey: {}", ctx.accounts.vault.key());
+        msg!("Vault is_signer: {}", ctx.accounts.vault.is_signer);
+        msg!("Vault is_writable: {}", ctx.accounts.vault.is_writable);
         // 执行每条指令
         for (i, instruction) in transaction.instructions.iter().enumerate() {
             msg!("Processing instruction {}", i);
 
             // 确保vault已经在指令的accounts中被正确设置为签名者
-            let vault_index = instruction.accounts
+            let vault_index = instruction
+                .accounts
                 .iter()
                 .position(|acc| acc.pubkey == vault.key())
                 .ok_or(ErrorCode::AccountNotFound)?;
-            
+
             // 转换账户元数据
-            let  accounts_metas: Vec<AccountMeta> = instruction.accounts
+            let accounts_metas: Vec<AccountMeta> = instruction
+                .accounts
                 .iter()
                 .enumerate()
                 .map(|(idx, acc)| {
                     let is_vault = idx == vault_index;
-                    AccountMeta {
-                        pubkey: acc.pubkey,
-                        is_signer: is_vault || acc.is_signer,
-                        is_writable: acc.is_writable,
+                    if is_vault {
+                        // vault 需要特殊处理，因为它需要被标记为签名者
+                        AccountMeta::new(acc.pubkey, true)
+                    } else {
+                        // 使用 to_account_meta 函数
+                        acc.to_account_meta()
                     }
                 })
                 .collect();
@@ -162,7 +190,8 @@ pub mod multisig_wallet {
             }
 
             // 从remaining_accounts中收集账户信息
-            let account_infos: Vec<AccountInfo> = ctx.remaining_accounts
+            let account_infos: Vec<AccountInfo> = ctx
+                .remaining_accounts
                 .iter()
                 .map(|acc| acc.to_account_info())
                 .collect();
@@ -170,20 +199,20 @@ pub mod multisig_wallet {
             msg!("Invoking CPI with {} account infos", account_infos.len());
 
             // 执行CPI调用
-            invoke_signed(
-                &ix,
-                &account_infos,
-                signer_seeds 
-
-            ).map_err(|_| error!(ErrorCode::TransactionExecutionFailed))?;
+            invoke_signed(&ix, &account_infos, signer_seeds)
+                .map_err(|_| error!(ErrorCode::TransactionExecutionFailed))?;
 
             msg!("Instruction {} executed successfully", i);
         }
-    
+
         transaction.executed = true;
         Ok(())
     }
-
+    pub fn close_transaction(_ctx: Context<CloseTransaction>) -> Result<()> {
+        // 账户的关闭和租金返
+        msg!("Closing transaction account and returning rent to recipient");
+        Ok(())
+    }
     // 修改阈值权重
     pub fn change_threshold(ctx: Context<ChangeThreshold>, new_threshold: u64) -> Result<()> {
         let wallet = &mut ctx.accounts.wallet;
@@ -270,19 +299,18 @@ pub mod multisig_wallet {
     }
 }
 
-
-
 // 签名权重计算
 fn calculate_total_weight(wallet: &Account<Wallet>, signers: &[Pubkey]) -> Result<u64> {
     let mut total_weight = 0u64;
-    
+
     for signer in signers.iter() {
         if let Some(owner) = wallet.owners.iter().find(|o| o.key == *signer) {
-            total_weight = total_weight.checked_add(owner.weight)
+            total_weight = total_weight
+                .checked_add(owner.weight)
                 .ok_or(ErrorCode::ArithmeticOverflow)?;
         }
     }
-    
+
     Ok(total_weight)
 }
 
@@ -307,12 +335,13 @@ pub struct ChangeOwnerWeights<'info> {
     pub proposer: Signer<'info>,
 }
 #[derive(Accounts)]
+#[instruction(owners: Vec<OwnerConfig>)]
 pub struct CreateWallet<'info> {
     #[account(
         init,
         payer = payer,
         space = 8 + // discriminator
-            (32 + 8) * 10 + // owner pubkey + weight (10 owners)
+            4 + (OwnerConfig::LEN * owners.len()) + // owners vec with length prefix
             8 + // threshold_weight
             1 + // nonce
             4   // owner_set_seqno
@@ -332,6 +361,11 @@ pub struct CreateWallet<'info> {
 }
 
 #[derive(Accounts)]
+#[instruction(
+    instructions: Vec<ProposedInstruction>,
+    max_accounts_per_instruction: u8,
+    max_data_size: u16
+)]
 pub struct CreateTransaction<'info> {
     pub wallet: Account<'info, Wallet>,
 
@@ -339,11 +373,12 @@ pub struct CreateTransaction<'info> {
         init,
         payer = owner,
         space = 8 + // discriminator
-            4 + (32 + 4 + (32 + 1 + 1) * 10 + 4 + 1024) * 5 + // instructions vec (5 instructions)
-            32 + // wallet
+            32 + // wallet pubkey
+            32 + // creator
             1 + // executed
-            4 + 32 * 10 + // signers vec (10 signers)
-            4   // owner_set_seqno
+            4 + (32 * MAX_SIGNERS) + // signers vec with length prefix
+            4 + // owner_set_seqno
+            4 + (ProposedInstruction::size(max_accounts_per_instruction as usize, max_data_size as usize) * MAX_INSTRUCTIONS) // instructions vec with length prefix
     )]
     pub transaction: Account<'info, Transaction>,
 
@@ -359,9 +394,6 @@ pub struct Approve<'info> {
     pub transaction: Account<'info, Transaction>,
     pub owner: Signer<'info>,
 }
-
-
-
 
 #[derive(Accounts)]
 pub struct ExecuteTransaction<'info> {
@@ -385,7 +417,7 @@ pub struct ExecuteTransaction<'info> {
     )]
     pub owner: Signer<'info>,
 
-    /// Vault PDA账户 
+    /// Vault PDA账户
     #[account(
         mut,  // 确保vault是可写的
         seeds = [b"vault", wallet.key().as_ref()],
@@ -408,6 +440,7 @@ pub struct Wallet {
 #[account]
 pub struct Transaction {
     pub wallet: Pubkey,
+    pub creator: Pubkey,
     pub instructions: Vec<ProposedInstruction>,
     pub executed: bool,
     pub signers: Vec<Pubkey>,
@@ -418,6 +451,10 @@ pub struct Transaction {
 pub struct OwnerConfig {
     pub key: Pubkey,
     pub weight: u64,
+}
+impl OwnerConfig {
+    const LEN: usize = 32 + // key
+        8; // weight
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone)]
@@ -432,6 +469,20 @@ pub struct TransactionAccount {
     pub pubkey: Pubkey,
     pub is_signer: bool,
     pub is_writable: bool,
+}
+// 首先为数据结构实现获取序列化大小的方法
+impl TransactionAccount {
+    const LEN: usize = 32 + // pubkey
+        1 + // is_signer
+        1; // is_writable
+}
+
+impl ProposedInstruction {
+    fn size(accounts_len: usize, data_len: usize) -> usize {
+        32 + // program_id
+        4 + (TransactionAccount::LEN * accounts_len) + // accounts vec with length prefix
+        4 + data_len // data vec with length prefix
+    }
 }
 
 impl TransactionAccount {
@@ -494,41 +545,23 @@ impl From<IncomingInstruction> for ProposedInstruction {
     }
 }
 
+// 添加关闭交易账户的指令上下文
+#[derive(Accounts)]
+pub struct CloseTransaction<'info> {
+    pub wallet: Account<'info, Wallet>,
 
-#[error_code]
-pub enum ErrorCode {
-    #[msg("Invalid wallet")]
-    InvalidWallet,
-    #[msg("Threshold must be greater than 0")]
-    InvalidThreshold,
-    #[msg("Threshold must be less than or equal to the total weight")]
-    ThresholdTooHigh,
-    #[msg("No owners provided")]
-    NoOwners,
-    #[msg("Not an owner")]
-    NotOwner,
-    #[msg("Transaction already executed")]
-    AlreadyExecuted,
-    #[msg("Already signed")]
-    AlreadySigned,
-    #[msg("Insufficient signers weight")]
-    InsufficientSigners,
-    #[msg("Owners must be unique")]
-    DuplicateOwner,
-    #[msg("Owner set has changed since transaction creation")]
-    OwnerSetChanged,
-    #[msg("Owner weight must be greater than 0")]
-    InvalidOwnerWeight,
-    #[msg("Owner not found")]
-    OwnerNotFound,
-    #[msg("Invalid number of owners")]
-    InvalidOwnerCount,
-    #[msg("Transaction execution failed")]
-    TransactionExecutionFailed,
-    #[msg("Arithmetic overflow")]
-    ArithmeticOverflow,
-    #[msg("Owner has not signed this transaction")]
-    NotSigned,
-    #[msg("Required account not found")]
-    AccountNotFound,
+    #[account(
+        mut,
+        constraint = transaction.wallet == wallet.key() @ ErrorCode::InvalidWallet,
+        constraint = transaction.executed @ ErrorCode::TransactionNotExecuted,
+        close = recipient // 这会在指令执行后关闭账户并将剩余租金转给 recipient
+    )]
+    pub transaction: Account<'info, Transaction>,
+
+    #[account(mut)]
+    pub recipient: SystemAccount<'info>,
+
+    // 可以选择只允许交易创建者关闭账户
+    #[account(constraint = owner.key() == transaction.creator @ ErrorCode::UnauthorizedClose)]
+    pub owner: Signer<'info>,
 }
