@@ -9,13 +9,24 @@ pub mod multisig_wallet {
     // 创建多签钱包
     pub fn create_wallet(
         ctx: Context<CreateWallet>,
-        owners: Vec<Pubkey>,
-        threshold: u64,
+        owners: Vec<OwnerConfig>,
+        threshold_weight: u64,
     ) -> Result<()> {
+        require!(threshold_weight > 0, ErrorCode::InvalidThreshold);
+        
+        // 计算所有者的总权重
+        let total_weight: u64 = owners.iter()
+            .map(|owner| owner.weight)
+            .sum();
+            
+        require!(threshold_weight <= total_weight, ErrorCode::ThresholdTooHigh);
+        require!(!owners.is_empty(), ErrorCode::NoOwners);
+
         let wallet = &mut ctx.accounts.wallet;
         wallet.owners = owners;
-        wallet.threshold = threshold;
+        wallet.threshold_weight = threshold_weight;
         wallet.nonce = ctx.bumps.vault;
+        
         Ok(())
     }
 
@@ -23,14 +34,28 @@ pub mod multisig_wallet {
     pub fn execute_transfer(
         ctx: Context<ExecuteTransfer>,
         amount: u64,
+        signatures: Vec<Pubkey>,
     ) -> Result<()> {
         let wallet = &ctx.accounts.wallet;
         
-        // 验证签名者是否是owner
-        let signer = ctx.accounts.owner.key();
+        // 计算签名的总权重
+        let mut total_signed_weight = 0u64;
+        for signer_key in signatures.iter() {
+            if let Some(owner) = wallet.owners.iter().find(|o| o.key == *signer_key) {
+                total_signed_weight += owner.weight;
+            }
+        }
+
+        // 验证签名权重是否达到阈值
         require!(
-            wallet.owners.contains(&signer),
-            ErrorCode::NotOwner
+            total_signed_weight >= wallet.threshold_weight,
+            ErrorCode::InsufficientSigners
+        );
+
+        // 验证当前交易签名者是否在签名列表中
+        require!(
+            signatures.contains(&ctx.accounts.owner.key()),
+            ErrorCode::InvalidSigner
         );
 
         // 使用PDA签名执行转账
@@ -57,6 +82,28 @@ pub mod multisig_wallet {
 
         Ok(())
     }
+
+    // 更新所有者权重
+    pub fn update_owner_weights(
+        ctx: Context<UpdateOwners>,
+        new_owners: Vec<OwnerConfig>,
+        new_threshold_weight: u64,
+    ) -> Result<()> {
+        require!(new_threshold_weight > 0, ErrorCode::InvalidThreshold);
+        
+        let total_weight: u64 = new_owners.iter()
+            .map(|owner| owner.weight)
+            .sum();
+            
+        require!(new_threshold_weight <= total_weight, ErrorCode::ThresholdTooHigh);
+        require!(!new_owners.is_empty(), ErrorCode::NoOwners);
+
+        let wallet = &mut ctx.accounts.wallet;
+        wallet.owners = new_owners;
+        wallet.threshold_weight = new_threshold_weight;
+        
+        Ok(())
+    }
 }
 
 #[derive(Accounts)]
@@ -64,7 +111,10 @@ pub struct CreateWallet<'info> {
     #[account(
         init,
         payer = payer,
-        space = 8 + 32 * 10 + 8 + 1 // 预留10个owner + threshold + nonce
+        space = 8 + // discriminator
+            (32 + 8) * 10 + // owner pubkey + weight (预留10个owner)
+            8 + // threshold_weight
+            1 // nonce
     )]
     pub wallet: Account<'info, Wallet>,
     
@@ -100,15 +150,36 @@ pub struct ExecuteTransfer<'info> {
     pub system_program: Program<'info, System>,
 }
 
+#[derive(Accounts)]
+pub struct UpdateOwners<'info> {
+    #[account(mut)]
+    pub wallet: Account<'info, Wallet>,
+    pub owner: Signer<'info>,
+}
+
 #[account]
 pub struct Wallet {
-    pub owners: Vec<Pubkey>,
-    pub threshold: u64,
+    pub owners: Vec<OwnerConfig>,
+    pub threshold_weight: u64,
     pub nonce: u8,
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
+pub struct OwnerConfig {
+    pub key: Pubkey,
+    pub weight: u64,
 }
 
 #[error_code]
 pub enum ErrorCode {
-    #[msg("Not an owner of the wallet")]
-    NotOwner,
+    #[msg("Threshold must be greater than 0")]
+    InvalidThreshold,
+    #[msg("Threshold must be less than or equal to the total weight")]
+    ThresholdTooHigh,
+    #[msg("No owners provided")]
+    NoOwners,
+    #[msg("Insufficient signers weight")]
+    InsufficientSigners,
+    #[msg("Invalid signer")]
+    InvalidSigner,
 }
