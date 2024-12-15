@@ -180,15 +180,15 @@ describe("multisig-wallet", () => {
       expect(finalBalance).to.be.greaterThan(initialBalance);
     });
     it("Executes multiple instructions in a transaction", async () => {
-        // 创建两个接收者
+        // crete two recipients
         const recipient1 = anchor.web3.Keypair.generate();
         const recipient2 = anchor.web3.Keypair.generate();
         
-        // 转账金额
+        // set transfer amounts
         const transferAmount1 = new BN(0.5 * LAMPORTS_PER_SOL);
         const transferAmount2 = new BN(0.3 * LAMPORTS_PER_SOL);
         
-        // 准备两个转账指令
+        // Create transfer instructions
         const transferIx1 = SystemProgram.transfer({
             fromPubkey: walletPDA,
             toPubkey: recipient1.publicKey,
@@ -201,7 +201,7 @@ describe("multisig-wallet", () => {
             lamports: transferAmount2.toNumber(),
         });
     
-        // 创建两个提议的指令
+        // Create proposed instructions
         const proposedInstructions = [
             {
                 programId: transferIx1.programId,
@@ -262,7 +262,7 @@ describe("multisig-wallet", () => {
                 systemProgram: SystemProgram.programId,
             })
             .remainingAccounts([
-                // 第一个转账指令的账户
+              // first transfer instruction's accounts
                 {
                     pubkey: SystemProgram.programId,
                     isWritable: false,
@@ -278,7 +278,7 @@ describe("multisig-wallet", () => {
                     isWritable: true,
                     isSigner: false,
                 },
-                // 第二个转账指令的账户
+                //second transfer instruction's accounts
                 {
                     pubkey: SystemProgram.programId,
                     isWritable: false,
@@ -298,21 +298,21 @@ describe("multisig-wallet", () => {
             .signers([owner1])
             .rpc();
     
-        // 等待交易确认
+            //wait for the transaction to be executed
         await new Promise(resolve => setTimeout(resolve, 1000));
     
-        // 验证交易执行
+        //verify transaction account is executed
         const txAccount = await program.account.transaction.fetch(multiTx.publicKey);
         expect(txAccount.executed).to.be.true;
     
-        // 验证两个接收者都收到了 SOL
+        //verify that both recipients received SOL
         const finalBalance1 = await provider.connection.getBalance(recipient1.publicKey);
         const finalBalance2 = await provider.connection.getBalance(recipient2.publicKey);
         
         expect(finalBalance1).to.be.greaterThan(initialBalance1);
         expect(finalBalance2).to.be.greaterThan(initialBalance2);
         
-        // 验证转账金额是否正确
+        //verify that the transfer amounts are correct
         expect(finalBalance1 - initialBalance1).to.equal(transferAmount1.toNumber());
         expect(finalBalance2 - initialBalance2).to.equal(transferAmount2.toNumber());
     }); 
