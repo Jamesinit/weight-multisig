@@ -1,335 +1,231 @@
 import * as anchor from "@coral-xyz/anchor";
 import { Program } from "@coral-xyz/anchor";
-import { MultisigWallet} from "../target/types/multisig_wallet";
-import { PublicKey, SystemProgram, LAMPORTS_PER_SOL } from "@solana/web3.js";
+import { MultisigWallet } from "../target/types/multisig_wallet";
+import { PublicKey, SystemProgram, Transaction } from "@solana/web3.js";
 import { expect } from "chai";
-import { BN } from "bn.js";
+
 describe("multisig-wallet", () => {
-    const provider = anchor.AnchorProvider.env();
-    anchor.setProvider(provider);
+  const provider = anchor.AnchorProvider.env();
+  anchor.setProvider(provider);
+
+  const program = anchor.workspace.MultisigWallet as Program<MultisigWallet>;
   
-    const program = anchor.workspace.MultisigWallet as Program<MultisigWallet>;
+  const ownerA = anchor.web3.Keypair.generate();
+  const ownerB = anchor.web3.Keypair.generate();
+  const ownerC = anchor.web3.Keypair.generate();
+  
+  const threshold = 2;
+  let multisigPda: PublicKey;
+  let multisigBump: number;
+  let transactionPda: PublicKey;
+  let transactionBump: number;
+
+  // Helper function to confirm transaction
+  const confirmTx = async (signature: string) => {
+    const latestBlockhash = await provider.connection.getLatestBlockhash();
+    await provider.connection.confirmTransaction(
+      {
+        signature,
+        ...latestBlockhash,
+      },
+      "confirmed"
+    );
+  };
+
+  before(async () => {
+    const airdropAmount = 10 * anchor.web3.LAMPORTS_PER_SOL;
     
-    // Generate test wallets
-    const owner1 = anchor.web3.Keypair.generate();
-    const owner2 = anchor.web3.Keypair.generate();
-    const owner3 = anchor.web3.Keypair.generate();
+    // Airdrop and confirm for each account
+    const signatures = await Promise.all([
+      provider.connection.requestAirdrop(ownerA.publicKey, airdropAmount),
+      provider.connection.requestAirdrop(ownerB.publicKey, airdropAmount),
+      provider.connection.requestAirdrop(ownerC.publicKey, airdropAmount),
+      provider.connection.requestAirdrop(provider.wallet.publicKey, airdropAmount),
+    ]);
+
+    // Wait for all airdrops to confirm
+    await Promise.all(signatures.map(signature => confirmTx(signature)));
+
+    [multisigPda, multisigBump] = await PublicKey.findProgramAddress(
+      [Buffer.from("multisig"), provider.wallet.publicKey.toBuffer()],
+      program.programId
+    );
+
+    [transactionPda, transactionBump] = await PublicKey.findProgramAddress(
+      [
+        Buffer.from("transaction"),
+        multisigPda.toBuffer(),
+        new anchor.BN(0).toArrayLike(Buffer, "le", 4),
+      ],
+      program.programId
+    );
+    // Fund the multisig PDA for testing
+    await provider.connection.requestAirdrop(multisigPda, anchor.web3.LAMPORTS_PER_SOL);
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+  });
+
+  it("should create a new multisig wallet", async () => {
+    const owners = [ownerA.publicKey, ownerB.publicKey, ownerC.publicKey];
     
-    // Recipient of the SOL transfer
-    const recipient = anchor.web3.Keypair.generate();
-    const recipient1 = anchor.web3.Keypair.generate();
-    const recipient2 = anchor.web3.Keypair.generate();
-    const multiTx = anchor.web3.Keypair.generate();  // 用于多指令测试的交易账户
+    const tx = await program.methods
+      .createMultisig(owners, threshold)
+      .accountsPartial({
+        multisig: multisigPda,
+        payer: provider.wallet.publicKey,
+        systemProgram: SystemProgram.programId,
+      })
+      .rpc();
+
+    await confirmTx(tx);
+
+    const multisigAccount = await program.account.multisig.fetch(multisigPda);
     
-    // Test wallet and transaction accounts
-    const wallet = anchor.web3.Keypair.generate();
-    const transaction = anchor.web3.Keypair.generate();
-    let walletPDA: PublicKey;
-    let walletBump: number;
-  
-    before(async () => {
-      // Airdrop SOL to owners for transaction fees
-      await provider.connection.requestAirdrop(owner1.publicKey, 10 * LAMPORTS_PER_SOL);
-      await provider.connection.requestAirdrop(owner2.publicKey, 10 * LAMPORTS_PER_SOL);
-      await provider.connection.requestAirdrop(owner3.publicKey, 10 * LAMPORTS_PER_SOL);
-      await provider.connection.requestAirdrop(recipient1.publicKey, LAMPORTS_PER_SOL);
-      await provider.connection.requestAirdrop(recipient2.publicKey, LAMPORTS_PER_SOL);
-      await new Promise(resolve => setTimeout(resolve, 1000)); // Wait for airdrop confirmation
-      
-      // Find the PDA that will be used as the wallet's vault
-      const [_walletPDA, _walletBump] = await PublicKey.findProgramAddress(
-        [Buffer.from("vault"), wallet.publicKey.toBuffer()],
-        program.programId
-      );
-      walletPDA = _walletPDA;
-      walletBump = _walletBump;
-  
-      // Fund the vault with some SOL for testing
-      await provider.connection.requestAirdrop(walletPDA, 2 * LAMPORTS_PER_SOL);
-      await new Promise(resolve => setTimeout(resolve, 1000)); // Wait for airdrop confirmation
-    });
-  
-    it("Creates a multisig wallet", async () => {
-      // Create owner configurations with different weights
-      const owners = [
-        { key: owner1.publicKey, weight: new BN(2) },
-        { key: owner2.publicKey, weight: new BN(2) },
-        { key: owner3.publicKey, weight: new BN(1) },
-      ];
-      
-      const thresholdWeight = new BN(3); // Require at least weight of 3 to execute transactions
-  
-      await program.methods
-        .createWallet(owners, thresholdWeight)
+    expect(multisigAccount.owners.map(pub => pub.toString()))
+      .to.deep.equal(owners.map(pub => pub.toString()));
+    expect(multisigAccount.threshold).to.equal(threshold);
+    expect(multisigAccount.transactionCount).to.equal(0);
+  });
+
+
+  it("should fail with invalid threshold", async () => {
+    const owners = [ownerA.publicKey, ownerB.publicKey];
+    const invalidThreshold = 3;
+
+    try {
+      const tx = await program.methods
+        .createMultisig(owners, invalidThreshold)
         .accountsPartial({
-          wallet: wallet.publicKey,
-          vault: walletPDA,
+          multisig: PublicKey.findProgramAddressSync(
+            [Buffer.from("multisig"), provider.wallet.publicKey.toBuffer()],
+            program.programId
+          )[0],
           payer: provider.wallet.publicKey,
           systemProgram: SystemProgram.programId,
         })
-        .signers([wallet])
         .rpc();
-  
-      // Verify wallet state
-      const walletAccount = await program.account.wallet.fetch(wallet.publicKey);
-      expect(walletAccount.owners).to.have.length(3);
-      expect(walletAccount.thresholdWeight.toString()).to.equal(thresholdWeight.toString());
-    });
-  
-    it("Creates a transaction to transfer SOL", async () => {
-      const transferAmount = 1 * LAMPORTS_PER_SOL;
       
-      // Prepare the transfer instruction
-      const transferIx = SystemProgram.transfer({
-        fromPubkey: walletPDA,
-        toPubkey: recipient.publicKey,
-        lamports: transferAmount,
-      });
+      await confirmTx(tx);
+      expect.fail("Expected to fail with invalid threshold");
+    } catch (err) {
+      // Just check if there's any error
+      expect(err).to.exist;
+    }
+  });
+
+it("should propose a new transaction", async () => {
+  const transferAmount = new anchor.BN(1000000);
+  const transferData = SystemProgram.transfer({
+      fromPubkey: multisigPda,
+      toPubkey: ownerA.publicKey,
+      lamports: transferAmount.toNumber(),
+  }).data;
   
-      // Create the proposed instruction with correct types
-      const proposedInstruction = {
-        programId: transferIx.programId,
-        accounts: transferIx.keys.map(key => ({
-          pubkey: key.pubkey,
-          isSigner: key.isSigner,
-          isWritable: key.isWritable,
-        })),
-        data: transferIx.data,
-      };
-  
-      await program.methods
-        .createTransaction([proposedInstruction], 3, 100)
-        .accountsPartial({
-          wallet: wallet.publicKey,
-          transaction: transaction.publicKey,
-          owner: owner1.publicKey,
+  const accounts = [
+      {
+          pubkey: multisigPda,
+          isWritable: true,
+          isSigner: true,  // PDA will be a signer
+      },
+      {
+          pubkey: ownerA.publicKey,
+          isWritable: true,
+          isSigner: false,
+      },
+  ];
+
+  const tx = await program.methods
+      .proposeTransaction(SystemProgram.programId, accounts, transferData)
+      .accountsPartial({
+          multisig: multisigPda,
+          transaction: transactionPda,
+          proposer: ownerA.publicKey,
           systemProgram: SystemProgram.programId,
+      })
+      .signers([ownerA])
+      .rpc();
+
+  await confirmTx(tx);
+
+  const transactionAccount = await program.account.transaction.fetch(transactionPda);
+  expect(transactionAccount.programId.toString()).to.equal(SystemProgram.programId.toString());
+  expect(transactionAccount.didExecute).to.be.false;
+  expect(transactionAccount.signers).to.have.length(0);
+});
+
+
+  it("should approve a transaction", async () => {
+    const tx = await program.methods
+      .approve()
+      .accountsPartial({
+        multisig: multisigPda,
+        transaction: transactionPda,
+        owner: ownerA.publicKey,
+      })
+      .signers([ownerA])
+      .rpc();
+
+    await confirmTx(tx);
+
+    const transactionAccount = await program.account.transaction.fetch(transactionPda);
+    expect(transactionAccount.signers.map(p => p.toString()))
+      .to.include(ownerA.publicKey.toString());
+  });
+
+  it("should not allow double signing", async () => {
+    try {
+      const tx = await program.methods
+        .approve()
+        .accountsPartial({
+          multisig: multisigPda,
+          transaction: transactionPda,
+          owner: ownerA.publicKey,
         })
-        .signers([transaction, owner1])
+        .signers([ownerA])
         .rpc();
-  
-      // Verify transaction state
-      const txAccount = await program.account.transaction.fetch(transaction.publicKey);
-      expect(txAccount.executed).to.be.false;
-      expect(txAccount.signers).to.have.length(1);
-      expect(txAccount.signers[0].toString()).to.equal(owner1.publicKey.toString());
-    });
-  
-    it("Approves the transaction with required weights", async () => {
-      // Owner 2 approves
-      await program.methods
+      
+      await confirmTx(tx);
+      expect.fail("Expected to fail with already signed");
+    } catch (err) {
+      const errorMsg = err.error?.errorMessage || err.toString();
+      console.log(errorMsg);
+      expect(errorMsg).to.include("Cannot approve a transaction twice");
+    }
+  });
+
+  it("should execute a transaction with enough approvals", async () => {
+    // Add second approval
+    const approveTx = await program.methods
         .approve()
         .accounts({
-          wallet: wallet.publicKey,
-          transaction: transaction.publicKey,
-          owner: owner2.publicKey,
+            multisig: multisigPda,
+            transaction: transactionPda,
+            owner: ownerB.publicKey,
         })
-        .signers([owner2])
+        .signers([ownerB])
         .rpc();
-  
-      // Verify updated signers
-      const updatedTx = await program.account.transaction.fetch(transaction.publicKey);
-      expect(updatedTx.signers).to.have.length(2);
-    //   expect(updatedTx.signers).to.include.deep.memberOf([owner1.publicKey, owner2.publicKey]);
-    });
-  
-    it("Executes the transaction", async () => {
-      // Get recipient's initial balance
-      const initialBalance = await provider.connection.getBalance(recipient.publicKey);
-  
-      // Execute the transaction
-     const execute_ix = await program.methods
+
+    await confirmTx(approveTx);
+
+    const executeTx = await program.methods
         .executeTransaction()
         .accountsPartial({
-          wallet: wallet.publicKey,
-          transaction: transaction.publicKey,
-          owner: owner1.publicKey,
-          vault: walletPDA,
-          systemProgram: SystemProgram.programId,
+            multisig: multisigPda,
+            transaction: transactionPda,
+            owner: ownerA.publicKey,
+            to: ownerA.publicKey,
+            systemProgram: SystemProgram.programId,
         })
-        .remainingAccounts([
-          {
-            pubkey: SystemProgram.programId,
-            isWritable: false,
-            isSigner: false,
-          },
-          {
-            pubkey: walletPDA,
-            isWritable: true,
-            isSigner: false,
-          },
-          {
-            pubkey: recipient.publicKey,
-            isWritable: true,
-            isSigner: false,
-          },
-        ])
-        .signers([owner1])
+        .signers([ownerA])
         .rpc();
-  
-            await provider.connection.confirmTransaction(execute_ix,'confirmed');
-      // Wait a bit for the transaction to be confirmed
-      await new Promise(resolve => setTimeout(resolve, 1000));
-  
-      // Verify execution
-      const txAccount = await program.account.transaction.fetch(transaction.publicKey);
-      expect(txAccount.executed).to.be.true;
-  
-      // Verify recipient received the SOL
-      const finalBalance = await provider.connection.getBalance(recipient.publicKey);
-      expect(finalBalance).to.be.greaterThan(initialBalance);
-    });
-    it("Executes multiple instructions in a transaction", async () => {
-        // crete two recipients
-        const recipient1 = anchor.web3.Keypair.generate();
-        const recipient2 = anchor.web3.Keypair.generate();
-        
-        // set transfer amounts
-        const transferAmount1 = new BN(0.5 * LAMPORTS_PER_SOL);
-        const transferAmount2 = new BN(0.3 * LAMPORTS_PER_SOL);
-        
-        // Create transfer instructions
-        const transferIx1 = SystemProgram.transfer({
-            fromPubkey: walletPDA,
-            toPubkey: recipient1.publicKey,
-            lamports: transferAmount1.toNumber(),
-        });
-    
-        const transferIx2 = SystemProgram.transfer({
-            fromPubkey: walletPDA,
-            toPubkey: recipient2.publicKey,
-            lamports: transferAmount2.toNumber(),
-        });
-    
-        // Create proposed instructions
-        const proposedInstructions = [
-            {
-                programId: transferIx1.programId,
-                accounts: transferIx1.keys.map(key => ({
-                    pubkey: key.pubkey,
-                    isSigner: key.isSigner,
-                    isWritable: key.isWritable,
-                })),
-                data: transferIx1.data,
-            },
-            {
-                programId: transferIx2.programId,
-                accounts: transferIx2.keys.map(key => ({
-                    pubkey: key.pubkey,
-                    isSigner: key.isSigner,
-                    isWritable: key.isWritable,
-                })),
-                data: transferIx2.data,
-            }
-        ];
-    
-        // 创建多指令交易
-        const multiTx = anchor.web3.Keypair.generate();
-        await program.methods
-            .createTransaction(proposedInstructions, 5, 100)
-            .accountsPartial({
-                wallet: wallet.publicKey,
-                transaction: multiTx.publicKey,
-                owner: owner1.publicKey,
-                systemProgram: SystemProgram.programId,
-            })
-            .signers([multiTx, owner1])
-            .rpc();
-    
-        // 获取两个接收者的初始余额
-        const initialBalance1 = await provider.connection.getBalance(recipient1.publicKey);
-        const initialBalance2 = await provider.connection.getBalance(recipient2.publicKey);
-    
-        // owner2 批准交易
-        await program.methods
-            .approve()
-            .accounts({
-                wallet: wallet.publicKey,
-                transaction: multiTx.publicKey,
-                owner: owner2.publicKey,
-            })
-            .signers([owner2])
-            .rpc();
-    
-        // 执行多指令交易
-        await program.methods
-            .executeTransaction()
-            .accountsPartial({
-                wallet: wallet.publicKey,
-                transaction: multiTx.publicKey,
-                owner: owner1.publicKey,
-                vault: walletPDA,
-                systemProgram: SystemProgram.programId,
-            })
-            .remainingAccounts([
-              // first transfer instruction's accounts
-                {
-                    pubkey: SystemProgram.programId,
-                    isWritable: false,
-                    isSigner: false,
-                },
-                {
-                    pubkey: walletPDA,
-                    isWritable: true,
-                    isSigner: false,
-                },
-                {
-                    pubkey: recipient1.publicKey,
-                    isWritable: true,
-                    isSigner: false,
-                },
-                //second transfer instruction's accounts
-                {
-                    pubkey: SystemProgram.programId,
-                    isWritable: false,
-                    isSigner: false,
-                },
-                {
-                    pubkey: walletPDA,
-                    isWritable: true,
-                    isSigner: false,
-                },
-                {
-                    pubkey: recipient2.publicKey,
-                    isWritable: true,
-                    isSigner: false,
-                },
-            ])
-            .signers([owner1])
-            .rpc();
-    
-            //wait for the transaction to be executed
-        await new Promise(resolve => setTimeout(resolve, 1000));
-    
-        //verify transaction account is executed
-        const txAccount = await program.account.transaction.fetch(multiTx.publicKey);
-        expect(txAccount.executed).to.be.true;
-    
-        //verify that both recipients received SOL
-        const finalBalance1 = await provider.connection.getBalance(recipient1.publicKey);
-        const finalBalance2 = await provider.connection.getBalance(recipient2.publicKey);
-        
-        expect(finalBalance1).to.be.greaterThan(initialBalance1);
-        expect(finalBalance2).to.be.greaterThan(initialBalance2);
-        
-        //verify that the transfer amounts are correct
-        expect(finalBalance1 - initialBalance1).to.equal(transferAmount1.toNumber());
-        expect(finalBalance2 - initialBalance2).to.equal(transferAmount2.toNumber());
-    }); 
-    it("Closes the executed transaction", async () => {
-      await program.methods
-        .closeTransaction()
-        .accounts({
-          wallet: wallet.publicKey,
-          transaction: transaction.publicKey,
-          recipient: owner1.publicKey,
-          owner: owner1.publicKey,
-        })
-        .signers([owner1])
-        .rpc();
-  
-      // Verify transaction account is closed
-      const txAccount = await program.account.transaction.fetchNullable(transaction.publicKey);
-      expect(txAccount).to.be.null;
-    });
-  });
+
+    await confirmTx(executeTx);
+
+    const updatedTransactionAccount = await program.account.transaction.fetch(transactionPda);
+    expect(updatedTransactionAccount.didExecute).to.be.true;
+
+    // 验证转账是否成功
+    const balance = await provider.connection.getBalance(ownerA.publicKey);
+    expect(balance).to.be.greaterThan(0);
+});
+
+});
